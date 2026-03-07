@@ -1,4 +1,4 @@
-# irc-chat
+# IRC-Chat
 
 An IRC-style chat server and client in C using the POSIX socket API over TCP/IP.
 
@@ -78,5 +78,6 @@ Connect a client:
 | `/ban <user>` | Ban user (admin only) |
 
 ## License
+
 
 MIT
