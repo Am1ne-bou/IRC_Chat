@@ -5,10 +5,13 @@
 
 #define USERS_FILE "users.txt"
 #define MAX_USERS 1000
+#define HASH_LEN 65 // 64 chars for SHA-256 + null terminator
+#define SALT_LEN 17 // 16 chars + null terminator
 
 typedef struct user {
     char login[LOGIN_LEN];
-    char password[PWD_LEN];
+    char salt[SALT_LEN]; // Random salt for password hashing
+    char password[HASH_LEN]; // Store hashed password
 } user_t;
 
 extern user_t users[MAX_USERS];

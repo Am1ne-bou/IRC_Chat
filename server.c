@@ -467,7 +467,7 @@ int handle_client_message(int sockfd) {
     if (msg.type == FILE_REQUEST) {
         handle_file_request(sockfd, &msg, buff);
         //log
-        char he[MSG_LEN + 64];
+        char he[MSG_LEN*2];
         snprintf(he, sizeof(he), "[%s] wants to send file '%s' to '%s'", client->nickname, buff, msg.infos);
         add_to_history(client->login, he);
         return 1;
@@ -606,7 +606,7 @@ static int handle_bind(const char *port){
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0) continue;
         int opt = 1;
-        setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
         close(fd);
         fd = -1;
