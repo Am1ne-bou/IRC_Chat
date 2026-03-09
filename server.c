@@ -28,6 +28,7 @@
 //----------- Client Management -----------
 typedef struct client_node {
     int         sockfd;
+    SSL         *ssl; // SSL structure for encrypted communication
     char        nickname[NICK_LEN];
     char        login[LOGIN_LEN];
     int         authenticated; // 1 if authenticated, 0 otherwise
@@ -95,6 +96,11 @@ static void remove_client(int sockfd) {
     while (*curr) {
         if ((*curr)->sockfd == sockfd) {
             client_node_t* tmp = *curr;
+            if (tmp->ssl){
+                SSL_shutdown(tmp->ssl);
+                SSL_free(tmp->ssl);
+            }
+            if (tmp->upload_fp) fclose(tmp->upload_fp);
             *curr = (*curr)->next;
             free(tmp);
             return;
@@ -107,6 +113,10 @@ static void remove_client(int sockfd) {
 static void cleanup_all_clients(void){
     client_node_t *c = clients_head;
     while (c) {
+        if (c->ssl) {
+            SSL_shutdown(c->ssl);
+            SSL_free(c->ssl);
+        }
         close(c->sockfd);
         if (c->upload_fp) fclose(c->upload_fp);
         client_node_t *next = c->next;
@@ -119,12 +129,12 @@ static void cleanup_all_clients(void){
 //-------------------------  Helper Function --------------------
 
 // Helper function to send a text reply to a client
-static int reply_text(int fd, enum msg_type type, const char *text){
+static int reply_text( SSL *ssl, enum msg_type type, const char *text){
     struct message r = {0};
     r.pld_len = (int)strlen(text);
     r.type    = type;
     strncpy(r.nick_sender, "Server", NICK_LEN - 1);
-    return send_msg(fd, &r, text);
+    return send_msg(ssl, &r, text);
 }
 
 // Ensure necessary directories exist at server startup
@@ -135,11 +145,11 @@ static void ensure_dirs(void){
 }
 
 // List files available on the server and send the list to the client using opendir and readdir
-static void list_files(int sockfd){
+static void list_files(SSL *ssl){
     char list[MSG_LEN] = {0};
     DIR *d = opendir(FILES_DIR);
     if (!d) {
-        reply_text(sockfd, FILE_LIST, "No files available.\n");
+        reply_text(ssl, FILE_LIST, "No files available.\n");
         return;
     }
 
@@ -155,20 +165,20 @@ static void list_files(int sockfd){
     closedir(d);
     
     if (strlen(list) == 0)
-        reply_text(sockfd, FILE_LIST, "No files available.\n");
+        reply_text(ssl, FILE_LIST, "No files available.\n");
     else
-        reply_text(sockfd, FILE_LIST, list);
+        reply_text(ssl  , FILE_LIST, list);
 }
 
 // -------------------------- P2P File Transfer Handling --------------------
 // Handle incoming file transfer requests (FILE_REQUEST) and forward them to the intended recipient
-static void handle_file_request(int sockfd, struct message *msg, const char *payload) {
+static void handle_file_request(SSL *sender_ssl, int sockfd, struct message *msg, const char *payload) {
     client_node_t *sender   = get_client_by_fd(sockfd);
     client_node_t *receiver = get_client_by_nick(msg->infos);
     if (!sender) return;
 
     if (!receiver) {
-        reply_text(sockfd, FILE_REJECT, "[Server] User not found\n");
+        reply_text(sender_ssl, FILE_REJECT, "[Server] User not found\n");
         return;
     }
 
@@ -176,7 +186,7 @@ static void handle_file_request(int sockfd, struct message *msg, const char *pay
     struct message fwd = *msg;
     strncpy(fwd.nick_sender, sender->nickname, NICK_LEN - 1);
     strncpy(fwd.infos, sender->nickname, INFOS_LEN - 1);
-    send_msg(receiver->sockfd, &fwd, payload);
+    send_msg(receiver->ssl, &fwd, payload);
 
     printf("[Server] File request: %s -> %s (%s)\n",
            sender->nickname, msg->infos, payload);
@@ -189,13 +199,13 @@ void handle_file_response(int sockfd, struct message *msg, const char *payload) 
     if (!responder) return;
 
     if (!original) {
-        reply_text(sockfd, ECHO_SEND, "[Server] Original sender disconnected\n");
+        reply_text(responder->ssl, ECHO_SEND, "[Server] Original sender disconnected\n");
         return;
     }
 
     struct message fwd = *msg;
     strncpy(fwd.nick_sender, responder->nickname, NICK_LEN - 1);
-    send_msg(original->sockfd, &fwd, payload);
+    send_msg(original->ssl, &fwd, payload);
 
     printf("[Server] File transfer %s: %s <-> %s\n",
            msg->type == FILE_ACCEPT ? "accepted" : "rejected",
@@ -203,13 +213,12 @@ void handle_file_response(int sockfd, struct message *msg, const char *payload) 
 }
 
 // -------------------------- Message Handling --------------------
-int handle_client_message(int sockfd) {
+int handle_client_message(SSL *ssl, int sockfd) {
     struct message msg;
     char buff[MSG_LEN];
     memset(&msg, 0, sizeof(msg));
     memset(buff, 0, MSG_LEN);
-
-    int recv_result = recv_msg(sockfd, &msg, buff, MSG_LEN);
+    int recv_result = recv_msg(ssl, &msg, buff, MSG_LEN);
     if (recv_result == -2) {
         printf("[Server] Client disconnected\n");
         return 0;
@@ -223,7 +232,7 @@ int handle_client_message(int sockfd) {
 
     // Require authentication for all message types except LOGIN   
     if (msg.type != LOGIN && !client->authenticated) {
-        reply_text(sockfd, ECHO_SEND,
+        reply_text(ssl, ECHO_SEND,
                    "[Server] Please authenticate first with /login <user> <pass>\n");
         return 1;
     }
@@ -232,10 +241,9 @@ int handle_client_message(int sockfd) {
     if (msg.type == LOGIN) {
         char* login = msg.login;
         char* password = msg.password;
-
         // check empty login or password
         if (strlen(login) == 0 || strlen(password) == 0) {
-            reply_text(sockfd, LOGIN_FAIL, "[Server] Invalid login or password\n");
+            reply_text(ssl, LOGIN_FAIL, "[Server] Invalid login or password\n");
             return 1;
         }
 
@@ -248,9 +256,13 @@ int handle_client_message(int sockfd) {
                 
                 char m[MSG_LEN];
                 snprintf(m, sizeof(m), "[Server] Registration OK! Welcome %s\n", login);
-                reply_text(sockfd, LOGIN_OK, m);
+                reply_text(ssl, LOGIN_OK, m);
+                char history_entry[MSG_LEN + 64];
+                snprintf(history_entry, sizeof(history_entry),
+                        "[Server] : User %s logged in\n", client->login);
+                add_to_history(client->login, history_entry);
             } else {
-                reply_text(sockfd, LOGIN_FAIL, "[Server] Registration failed\n");
+                reply_text(ssl, LOGIN_FAIL, "[Server] Registration failed\n");
             }
         } else {
             // user exists
@@ -260,15 +272,18 @@ int handle_client_message(int sockfd) {
                 
                 char m[MSG_LEN];
                 snprintf(m, sizeof(m), "[Server] Login OK! Welcome back %s\n", login);
-                reply_text(sockfd, LOGIN_OK, m);
-
+                reply_text(ssl, LOGIN_OK, m);
+                // save to history
+                char history_entry[MSG_LEN + 64];
+                snprintf(history_entry, sizeof(history_entry), "[Server] : User %s logged in\n", client->login);
+                add_to_history(client->login, history_entry);
                 // send history
                 size_t history_size;
                 char* history = read_user_history(login, &history_size);
                 if (history) {
                     struct message reply = {.pld_len = (int)history_size, .type = HISTORY_SEND};
                     strncpy(reply.nick_sender, "Server", NICK_LEN);
-                    if (send_msg(sockfd, &reply, history) < 0) {
+                    if (send_msg(ssl, &reply, history) < 0) {
                         perror("send_msg");
                         free(history);
                         return 0;
@@ -277,14 +292,11 @@ int handle_client_message(int sockfd) {
                 }
 
             } else {
-                reply_text(sockfd, LOGIN_FAIL,
+                reply_text(ssl, LOGIN_FAIL,
                            "[Server] Authentication failed: wrong password\n");
             }
         }
-        // save to history
-        char history_entry[MSG_LEN + 64];
-        snprintf(history_entry, sizeof(history_entry), "[Server] : User %s logged in\n", client->login);
-        add_to_history(client->login, history_entry);
+
         return 1;
     }
 
@@ -296,21 +308,21 @@ int handle_client_message(int sockfd) {
             if (!isalnum(nick[i])) valid = 0;
 
         if (!valid) {
-            reply_text(sockfd, ECHO_SEND,
+            reply_text(ssl, ECHO_SEND,
                        "[Server] Invalid nickname (alphanumeric only)\n");
             return 1;
         }
         if (is_nickname_taken(nick, sockfd)) {
             char m[MSG_LEN];
             snprintf(m, sizeof(m), "[Server] Nickname '%s' is already taken\n", nick);
-            reply_text(sockfd, ECHO_SEND, m);
+            reply_text(ssl, ECHO_SEND, m);
             return 1;
         }
 
         strncpy(client->nickname, nick, NICK_LEN - 1);
         char m[MSG_LEN];
         snprintf(m, sizeof(m), "[Server] : Welcome on the chat %s\n", nick);
-        reply_text(sockfd, ECHO_SEND, m);
+        reply_text(ssl, ECHO_SEND, m);
 
         add_to_history(client->login, m);
         return 1;
@@ -318,7 +330,7 @@ int handle_client_message(int sockfd) {
 
     /* Require nickname for all commands below */
     if (strlen(client->nickname) == 0) {
-        reply_text(sockfd, ECHO_SEND,
+        reply_text(ssl, ECHO_SEND,
                    "[Server] Set your nickname first with /nick <pseudo>\n");
         return 1;
     }
@@ -333,7 +345,7 @@ int handle_client_message(int sockfd) {
                 strcat(list, "\n");
             }
         }
-        reply_text(sockfd, ECHO_SEND, list);
+        reply_text(ssl, ECHO_SEND, list);
         //log
         char he[MSG_LEN + 64];
         snprintf(he, sizeof(he), "[%s] used /who", client->nickname);
@@ -347,7 +359,7 @@ int handle_client_message(int sockfd) {
         if (!t) {
             char m[MSG_LEN];
             snprintf(m, sizeof(m), "[Server] User %s not found\n", msg.infos);
-            reply_text(sockfd, ECHO_SEND, m);
+            reply_text(ssl, ECHO_SEND, m);
             return 1;
         }
 
@@ -370,7 +382,7 @@ int handle_client_message(int sockfd) {
         snprintf(m, sizeof(m),
                  "[Server] %s connected since %s with IP %s port %d\n",
                  t->nickname, date, ip, port);
-        reply_text(sockfd, ECHO_SEND, m);
+        reply_text(ssl, ECHO_SEND, m);
 
         char he[MSG_LEN + 64];
         format_message_for_history(he, sizeof(he), "Server", client->nickname, m, 0);
@@ -381,7 +393,7 @@ int handle_client_message(int sockfd) {
     // Admin ban user
     if (msg.type == ADMIN_BAN) {
         if (strcmp(client->login, ADMIN_LOGIN) != 0) {
-            reply_text(sockfd, ECHO_SEND, "[Server] Only admin can use /ban\n");
+            reply_text(ssl, ECHO_SEND, "[Server] Only admin can use /ban\n");
             return 1;
         }
 
@@ -389,7 +401,7 @@ int handle_client_message(int sockfd) {
         if (!target) {
             char m[MSG_LEN];
             snprintf(m, sizeof(m), "[Server] User %s not found\n", msg.infos);
-            reply_text(sockfd, ECHO_SEND, m);
+            reply_text(ssl, ECHO_SEND, m);
             // log
             char he[MSG_LEN + 64];
             snprintf(he, sizeof(he), "[admin] banned %s", msg.infos);
@@ -397,14 +409,14 @@ int handle_client_message(int sockfd) {
             return 1;
         }
 
-        reply_text(target->sockfd, USER_BANNED,
+        reply_text(target->ssl, USER_BANNED,
                    "[Server] You have been banned by the administrator.\n");
         close(target->sockfd);
         remove_client(target->sockfd);
 
         char m[MSG_LEN];
         snprintf(m, sizeof(m), "[Server] User %s has been banned\n", msg.infos);
-        reply_text(sockfd, ECHO_SEND, m);
+        reply_text(ssl, ECHO_SEND, m);
         return 1;
     }
 
@@ -419,7 +431,7 @@ int handle_client_message(int sockfd) {
         }
 
         if (msg.infos[i] == '\0') {
-            reply_text(sockfd, ECHO_SEND, "[Server] Usage: /msg <user> <message>\n");
+            reply_text(ssl, ECHO_SEND, "[Server] Usage: /msg <user> <message>\n");
             return 1;
         }
 
@@ -428,13 +440,13 @@ int handle_client_message(int sockfd) {
         if (!t) {
             char m[MSG_LEN];
             snprintf(m, sizeof(m), "[Server] User %s does not exist\n", target_nick);
-            reply_text(sockfd, ECHO_SEND, m);
+            reply_text(ssl, ECHO_SEND, m);
             return 1;
         }
 
         char full[MSG_LEN + 256];
         snprintf(full, sizeof(full), "[%s] : %s\n", client->nickname, priv_msg);
-        reply_text(t->sockfd, ECHO_SEND, full);
+        reply_text(t->ssl, ECHO_SEND, full);
 
         char he[MSG_LEN + 64];
         format_message_for_history(he, sizeof(he),
@@ -451,9 +463,9 @@ int handle_client_message(int sockfd) {
 
         for (client_node_t *c = clients_head; c; c = c->next) {
             if (c->sockfd != sockfd && strlen(c->nickname) > 0)
-                reply_text(c->sockfd, ECHO_SEND, fmt);
+                reply_text(c->ssl, ECHO_SEND, fmt);
         }
-        reply_text(sockfd, ECHO_SEND, "Message broadcasted\n");
+        reply_text(ssl, ECHO_SEND, "Message broadcasted\n");
 
         char he[MSG_LEN + 64];
         format_message_for_history(he, sizeof(he), client->nickname, "all", buff, 1);
@@ -465,7 +477,7 @@ int handle_client_message(int sockfd) {
 
     // P2P file transfer request and response handling
     if (msg.type == FILE_REQUEST) {
-        handle_file_request(sockfd, &msg, buff);
+        handle_file_request(ssl, sockfd, &msg, buff);
         //log
         char he[MSG_LEN*2];
         snprintf(he, sizeof(he), "[%s] wants to send file '%s' to '%s'", client->nickname, buff, msg.infos);
@@ -505,7 +517,7 @@ int handle_client_message(int sockfd) {
                    client->upload_filename, client->nickname);
             client->upload_fp = NULL;
             client->upload_filename[0] = '\0';
-            reply_text(sockfd, FILE_ACK, "[Server] File received successfully\n");
+            reply_text(ssl, FILE_ACK, "[Server] File received successfully\n");
 
             char he[MSG_LEN + 64];
             char m[MSG_LEN];
@@ -519,7 +531,7 @@ int handle_client_message(int sockfd) {
 
     // List files on the server
     if (msg.type == FILE_LIST) {
-        list_files(sockfd);
+        list_files(ssl);
         // log
         char he[MSG_LEN + 64];
         snprintf(he, sizeof(he), "[%s] listed files", client->nickname);
@@ -536,7 +548,7 @@ int handle_client_message(int sockfd) {
         if (!f) {
             char m[MSG_LEN];
             snprintf(m, sizeof(m), "[Server] File '%s' not found\n", msg.infos);
-            reply_text(sockfd, ECHO_SEND, m);
+            reply_text(ssl, ECHO_SEND, m);
             return 1;
         }
 
@@ -547,14 +559,14 @@ int handle_client_message(int sockfd) {
             r.pld_len = (int)n;
             r.type    = FILE_DOWNLOAD;
             strncpy(r.nick_sender, "Server", NICK_LEN - 1);
-            if (send_msg(sockfd, &r, chunk) < 0) break;
+            if (send_msg(ssl, &r, chunk) < 0) break;
         }
 
         /* End-of-file marker */
         struct message eof = {0};
         eof.type = FILE_DOWNLOAD;
         strncpy(eof.nick_sender, "Server", NICK_LEN - 1);
-        send_msg(sockfd, &eof, "");
+        send_msg(ssl, &eof, "");
 
         fclose(f);
         printf("[Server] Sent file '%s' to %s\n", msg.infos, client->nickname);
@@ -575,7 +587,7 @@ int handle_client_message(int sockfd) {
 
         printf("[Server] %s says: %s\n", client->nickname, buff);
         struct message r = msg;
-        send_msg(sockfd, &r, buff);
+        send_msg(ssl, &r, buff);
 
         char he[MSG_LEN + 64];
         format_message_for_history(he, sizeof(he),
@@ -585,7 +597,7 @@ int handle_client_message(int sockfd) {
     }
 
     /* Unknown message type */
-    reply_text(sockfd, ECHO_SEND, "[Server] Unknown command\n");
+    reply_text(ssl, ECHO_SEND, "[Server] Unknown command\n");
     return 1;
 }
 
@@ -638,6 +650,26 @@ int main(int argc, char *argv[]){
     }
     printf("[Server] Listening on port %s\n", argv[1]);
 
+    //TLS initialization
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+
+    //Create SSL context
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) {
+        ERR_print_errors_fp(stderr);
+        return EXIT_FAILURE;
+    }
+
+    // Load server certificate and private key
+    if (SSL_CTX_use_certificate_file(ctx, "server.crt", SSL_FILETYPE_PEM) <= 0 || 
+        SSL_CTX_use_PrivateKey_file(ctx, "server.key", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_CTX_free(ctx);
+        return EXIT_FAILURE;
+    }
+
     struct pollfd fds[MAX_CLIENTS] = {0};
     fds[0].fd     = sfd;
     fds[0].events = POLLIN;
@@ -661,9 +693,24 @@ int main(int argc, char *argv[]){
                 int newfd = accept(sfd, (struct sockaddr *)&addr, &len);
                 if (newfd < 0) { perror("accept"); continue; }
 
+                // Set up SSL for the new connection
+                SSL *ssl = SSL_new(ctx);
+                SSL_set_fd(ssl, newfd);
+                if (SSL_accept(ssl) <= 0) {
+                    ERR_print_errors_fp(stderr);
+                    SSL_free(ssl);
+                    close(newfd);
+                    continue;
+                }
+
                 printf("[Server] New connection: fd %d\n", newfd);
                 add_client(newfd, addr, len);
 
+                // Store SSL pointer in the client structure for later use
+                client_node_t *new_client = get_client_by_fd(newfd);
+                new_client->ssl = ssl;
+
+                // Add the new client to the pollfd array
                 if (nfds < MAX_CLIENTS) {
                     fds[nfds].fd     = newfd;
                     fds[nfds].events = POLLIN;
@@ -675,7 +722,8 @@ int main(int argc, char *argv[]){
                 }
             } else {
                 int cfd = fds[i].fd;
-                if (handle_client_message(cfd) == 0) {
+                client_node_t *cli = get_client_by_fd(cfd);
+                if (handle_client_message(cli->ssl, cfd) == 0) {
                     printf("[Server] Disconnected: fd %d\n", cfd);
                     close(cfd);
                     remove_client(cfd);
@@ -689,6 +737,7 @@ int main(int argc, char *argv[]){
 
     printf("\n[Server] Shutting down...\n");
     cleanup_all_clients();
+    SSL_CTX_free(ctx);
     close(sfd);
     return 0;
 }

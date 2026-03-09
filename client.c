@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 
 #include "common.h"
 
@@ -78,7 +79,7 @@ static int receive_file_p2p(int port, const char *filename, const char *nick) {
     while (1) {
         memset(&m, 0, sizeof(m));
         memset(buf, 0, MSG_LEN);
-        if (recv_msg(peer, &m, buf, MSG_LEN) < 0) break;
+        if (recv_msg_raw(peer, &m, buf, MSG_LEN) < 0) break;
         if (m.type != FILE_SEND) break;
         if (m.pld_len == 0) break;   /* end-of-file marker */
         fwrite(buf, 1, m.pld_len, f);
@@ -130,7 +131,7 @@ static int send_file_p2p(const char *addr_port, const char *filename, const char
         struct message m = {.pld_len = (int)n, .type = FILE_SEND};
         strncpy(m.nick_sender, nick, NICK_LEN - 1);
         strncpy(m.infos, base, INFOS_LEN - 1);
-        if (send_msg(fd, &m, buf) < 0) break;
+        if (send_msg_raw(fd, &m, buf) < 0) break;
         total += n;
     }
 
@@ -138,7 +139,7 @@ static int send_file_p2p(const char *addr_port, const char *filename, const char
     struct message eof = {.pld_len = 0, .type = FILE_SEND};
     strncpy(eof.nick_sender, nick, NICK_LEN - 1);
     strncpy(eof.infos, base, INFOS_LEN - 1);
-    send_msg(fd, &eof, NULL);
+    send_msg_raw(fd, &eof, NULL);
 
     printf("[P2P] Sent '%s' (%d bytes)\n", base, total);
     fclose(f);
@@ -160,10 +161,12 @@ static void try_extract_nick(const char *buff, const char *prefix, char *nicknam
 }
 
 //-------------------------- Client Loop --------------------
-static void client_loop(int sockfd){
+static void client_loop(SSL *ssl) {
     struct message msg;
     char buff[MSG_LEN];
     char nickname[NICK_LEN] = "";
+
+    int sockfd = SSL_get_fd(ssl);  
 
     struct pollfd fds[2] = {
         {.fd = STDIN_FILENO, .events = POLLIN},
@@ -186,7 +189,6 @@ static void client_loop(int sockfd){
             memset(buff, 0, MSG_LEN);
             if (!fgets(buff, MSG_LEN, stdin)) break;
             buff[strcspn(buff, "\n")] = '\0';
-
             memset(&msg, 0, sizeof(msg));
             
             if (strncmp(buff, "/nick ", 6) == 0) { // Set nickname command
@@ -220,7 +222,7 @@ static void client_loop(int sockfd){
                 msg.type    = BROADCAST_SEND;
                 msg.pld_len = strlen(buff + 8);
                 strncpy(msg.nick_sender, nickname, NICK_LEN - 1);
-                if (send_msg(sockfd, &msg, buff + 8) < 0) break;
+                if (send_msg(ssl, &msg, buff + 8) < 0) break;
                 printf("> ");
                 fflush(stdout);
                 continue;
@@ -262,14 +264,14 @@ static void client_loop(int sockfd){
                     fm.pld_len = (int)n;
                     strncpy(fm.nick_sender, nickname, NICK_LEN - 1);
                     strncpy(fm.infos, base, INFOS_LEN - 1);
-                    if (send_msg(sockfd, &fm, fbuf) < 0) break;
+                    if (send_msg(ssl, &fm, fbuf) < 0) break;
                 }
                 // Send end-of-file marker
                 struct message eof = {0};
                 eof.type = FILE_SEND;
                 strncpy(eof.nick_sender, nickname, NICK_LEN - 1);
                 strncpy(eof.infos, base, INFOS_LEN - 1);
-                send_msg(sockfd, &eof, NULL);
+                send_msg(ssl, &eof, NULL);
                 fclose(fp);
                 printf("File '%s' sent to server\n> ", base);
                 fflush(stdout);
@@ -306,12 +308,12 @@ static void client_loop(int sockfd){
                 struct message req = {0};
                 req.type = FILE_DOWNLOAD_REQUEST;
                 strncpy(req.infos, fname, INFOS_LEN - 1);
-                if (send_msg(sockfd, &req, NULL) < 0) break;
+                if (send_msg(ssl, &req, NULL) < 0) break;
 
                 // Wait for server response and handle file download
                 struct message rm;
                 char rbuf[MSG_LEN];
-                int r = recv_msg(sockfd, &rm, rbuf, MSG_LEN);
+                int r = recv_msg(ssl, &rm, rbuf, MSG_LEN);
                 if (r < 0) { printf("> "); fflush(stdout); continue; }
 
                 // If server sent an error (not FILE_DOWNLOAD), print it and skip
@@ -328,7 +330,7 @@ static void client_loop(int sockfd){
                 struct message m;
                 char chunk[MSG_LEN];
                 while (1) {
-                    int r = recv_msg(sockfd, &m, chunk, MSG_LEN);
+                    int r = recv_msg(ssl, &m, chunk, MSG_LEN);
                     if (r < 0) break;
                     if (r == 0 ||m.type != FILE_DOWNLOAD) break;
                     fwrite(chunk, 1, r, f);
@@ -368,7 +370,7 @@ static void client_loop(int sockfd){
                 strncpy(req.nick_sender, nickname, NICK_LEN - 1);
                 strncpy(req.infos, target, INFOS_LEN - 1);
                 req.pld_len = strlen(fname) + 1;
-                if (send_msg(sockfd, &req, fname) < 0) break;
+                if (send_msg(ssl, &req, fname) < 0) break;
 
                 printf("Transfer request sent to %s for '%s'\n> ", target, fname);
                 fflush(stdout);
@@ -380,7 +382,7 @@ static void client_loop(int sockfd){
                 msg.pld_len = strlen(buff);
                 if (strlen(nickname) > 0)
                     strncpy(msg.nick_sender, nickname, NICK_LEN - 1);
-                if (send_msg(sockfd, &msg, buff) < 0) break;
+                if (send_msg(ssl, &msg, buff) < 0) break;
                 printf("> ");
                 fflush(stdout);
                 continue;
@@ -389,17 +391,42 @@ static void client_loop(int sockfd){
             // For commands that don't require immediate user input, send the message to the server
             if (strlen(nickname) > 0)
                 strncpy(msg.nick_sender, nickname, NICK_LEN - 1);
-            if (send_msg(sockfd, &msg, NULL) < 0) break;
+            if (send_msg(ssl, &msg, NULL) < 0) break;
             printf("> ");
             fflush(stdout);
         }
 
         // Check for messages from server
         if (fds[1].revents & POLLIN) {
+
+            /*TLS fix poll sees tls as readable but recv_msg would block, 
+            so we need to call recv_msg in a loop until we get a message or an error
+            */
+
+            int flags = fcntl(sockfd, F_GETFL, 0);
+            fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+            char peek;
+            int pr = SSL_peek(ssl, &peek, 1);
+            fcntl(sockfd, F_SETFL, flags); // restore original flags
+            if (pr <= 0) {
+                int err = SSL_get_error(ssl, pr);
+                if (err == SSL_ERROR_WANT_READ)  continue;
+                else if (err == SSL_ERROR_ZERO_RETURN) {
+                    printf("[Client] Server disconnected\n");
+                    break;
+                }
+                else {
+                    fprintf(stderr, "SSL_peek error: %d\n", err);
+                    printf("[Client] Server disconnected\n");
+                    break;
+                }
+            }
+
+
             memset(&msg, 0, sizeof(msg));
             memset(buff, 0, MSG_LEN);
 
-            int ret2 = recv_msg(sockfd, &msg, buff, MSG_LEN);
+            int ret2 = recv_msg(ssl, &msg, buff, MSG_LEN);
             if (ret2 <= 0) {
                 printf("[Client] Server disconnected\n");
                 break;
@@ -428,8 +455,8 @@ static void client_loop(int sockfd){
                         struct message acc = {.type = FILE_ACCEPT};
                         strncpy(acc.infos, msg.nick_sender, INFOS_LEN - 1);
                         acc.pld_len = strlen(ap) + 1;
-                        send_msg(sockfd, &acc, ap);
-
+                        send_msg(ssl, &acc, ap);
+                        // Start receiving the file in a separately to avoid blocking the main loop
                         receive_file_p2p(p2p_port, buff, nickname);
                     } else {
                         struct message rej = {.type = FILE_REJECT};
@@ -437,7 +464,7 @@ static void client_loop(int sockfd){
                         char em[256];
                         snprintf(em, sizeof(em), "Rejected by %s", nickname);
                         rej.pld_len = strlen(em) + 1;
-                        send_msg(sockfd, &rej, em);
+                        send_msg(ssl, &rej, em);
                         printf("Transfer rejected\n");
                     }
                 }
@@ -448,6 +475,7 @@ static void client_loop(int sockfd){
                 printf("\n%s accepted transfer. Connecting to %s...\n",
                        msg.nick_sender, buff);
                 if (strlen(pending_filename) > 0) {
+                    // Start sending the file in a separately to avoid blocking the main loop
                     send_file_p2p(buff, pending_filename, nickname);
                     pending_filename[0] = '\0';
                 } else {
@@ -528,8 +556,29 @@ int main(int argc, char *argv[]){
     signal(SIGINT, sigint_handler);
 
     int fd = do_connect(argv[1], argv[2]);
+
+    //TLS setup
+    SSL_library_init();
+    SSL_load_error_strings();
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    SSL *ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, fd);
+
+    // Perform TLS handshake
+    if (SSL_connect(ssl) <= 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        close(fd);
+        return EXIT_FAILURE;
+    }
     printf("Connected to %s:%s\n", argv[1], argv[2]);
-    client_loop(fd);
+
+    client_loop(ssl);
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
     close(fd);
     return 0;
 }
